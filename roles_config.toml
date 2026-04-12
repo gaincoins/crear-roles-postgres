@@ -1,0 +1,137 @@
+# =============================================================================
+# roles_config.toml
+# Plantillas SQL y definición de roles para PostgreSQLRoleCreator
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# PLANTILLAS SQL
+# Los placeholders {variable} son sustituidos por el código Python con .format()
+# Todas las sentencias son SQL directo — sin bloques DO $$ ni lógica procedural
+# -----------------------------------------------------------------------------
+[sql]
+
+# Crear un rol (si ya existe, Python captura DuplicateObjectError)
+create_role = "CREATE ROLE {role_name} WITH INHERIT NOLOGIN CONNECTION LIMIT 0;"
+
+# GRANT directo (idempotente en PostgreSQL)
+grant_role = "GRANT {privilege} TO {to_role}{admin_clause};"
+
+# REVOKE directo
+revoke_role = "REVOKE {privilege} FROM {from_role};"
+
+# GRANT sobre todos los objetos de un tipo en un esquema (genérico)
+grant_on_all = "GRANT {privileges} ON ALL {object_type} IN SCHEMA {schema} TO {role};"
+
+# ALTER DEFAULT PRIVILEGES para objetos futuros (genérico)
+default_privs = "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT {privileges} ON {object_type} TO {role};"
+
+# Listar bases de datos de usuario (excluye las del sistema)
+list_databases = """
+SELECT d.datname AS nombre_base_datos, r.rolname AS owner
+FROM pg_database d
+JOIN pg_roles r ON d.datdba = r.oid
+WHERE d.datname NOT IN ('postgres', 'template0', 'template1', 'cloudsqladmin')
+  AND d.datistemplate = false
+ORDER BY d.datname;
+"""
+
+# Listar esquemas de usuario en la base de datos actual
+list_schemas = """
+SELECT schema_name
+FROM information_schema.schemata
+WHERE schema_name NOT IN ('pg_catalog', 'information_schema')
+  AND schema_name NOT LIKE 'pg_%'
+ORDER BY schema_name;
+"""
+
+
+# -----------------------------------------------------------------------------
+# ROLES GLOBALES
+# Se crean una sola vez en el servidor (no son por base de datos)
+# -----------------------------------------------------------------------------
+[roles]
+
+[[roles.global]]
+name   = "role_dba"
+grants = []
+
+[[roles.global]]
+name   = "role_monitoring"
+grants = ["pg_signal_backend"]
+
+# GRANTs entre roles globales — se ejecutan tras crear todos los roles globales
+[[roles.global_post_grants]]
+privilege    = "postgres"
+to_role      = "role_dba"
+admin_option = true
+
+[[roles.global_post_grants]]
+privilege    = "role_monitoring"
+to_role      = "role_dba"
+admin_option = true
+
+
+# -----------------------------------------------------------------------------
+# ROLES POR BASE DE DATOS (plantillas)
+# Cada [[db_roles]] define un tipo de rol que se crea por cada BD procesada.
+# {db} en name_pattern se reemplaza por el nombre normalizado de la BD.
+# -----------------------------------------------------------------------------
+
+# --- Owner: hereda el owner original de la BD ---
+[[db_roles]]
+name_pattern     = "role_owner_{db}"
+inherit_db_owner = true
+connect          = false
+schema_usage     = false
+
+    [[db_roles.grants_to]]
+    role         = "role_dba"
+    admin_option = true
+
+    [[db_roles.grants_to]]
+    role         = "role_monitoring"
+
+
+# --- Writer: CRUD sobre tablas + uso de secuencias ---
+[[db_roles]]
+name_pattern     = "role_writer_{db}"
+inherit_db_owner = false
+connect          = true
+schema_usage     = true
+
+    [[db_roles.object_privileges]]
+    object_type        = "TABLES"
+    privileges         = "SELECT, INSERT, UPDATE, DELETE"
+    default_privileges = true
+
+    [[db_roles.object_privileges]]
+    object_type        = "SEQUENCES"
+    privileges         = "USAGE"
+    default_privileges = true
+
+    [[db_roles.grants_to]]
+    role         = "role_dba"
+    admin_option = true
+
+
+# --- Reader: solo lectura sobre tablas + uso de secuencias ---
+[[db_roles]]
+name_pattern     = "role_reader_{db}"
+inherit_db_owner = false
+connect          = true
+schema_usage     = true
+
+    [[db_roles.object_privileges]]
+    object_type        = "TABLES"
+    privileges         = "SELECT"
+    default_privileges = true
+
+    [[db_roles.object_privileges]]
+    object_type        = "SEQUENCES"
+    privileges         = "USAGE"
+    default_privileges = true
+
+    [[db_roles.grants_to]]
+    role         = "role_dba"
+    admin_option = true
