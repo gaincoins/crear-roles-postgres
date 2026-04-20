@@ -88,21 +88,28 @@ class PostgreSQLRoleCreator:
     # Constructores de SQL (leen plantillas del archivo TOML)
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _qi(identifier: str) -> str:
+        """Envuelve un identificador simple en comillas dobles (case-safe para PostgreSQL)."""
+        return f'"{identifier}"'
+
     def _create_role_sql(self, role_name: str) -> str:
         return self.config["sql"]["create_role"].format(role_name=role_name)
 
     def _grant_sql(self, privilege: str, to_role: str, admin_option: bool = False) -> str:
+        """Construye GRANT. 'privilege' puede ser un identificador simple o una cláusula
+        compuesta (e.g. 'CONNECT ON DATABASE "mydb"'); 'to_role' siempre es un rol."""
         admin_clause = " WITH ADMIN OPTION" if admin_option else ""
         return self.config["sql"]["grant_role"].format(
             privilege=privilege,
-            to_role=to_role,
+            to_role=self._qi(to_role),
             admin_clause=admin_clause,
         )
 
     def _revoke_sql(self, privilege: str, from_role: str) -> str:
         return self.config["sql"]["revoke_role"].format(
             privilege=privilege,
-            from_role=from_role,
+            from_role=self._qi(from_role),
         )
 
     # -------------------------------------------------------------------------
@@ -120,14 +127,14 @@ class PostgreSQLRoleCreator:
             await self.execute(self._create_role_sql(name))
             for grant in role_def.get("grants", []):
                 print(f"  Grant {grant} a {name}...")
-                await self.execute(self._grant_sql(grant, name))
+                await self.execute(self._grant_sql(self._qi(grant), name))
 
         for grant_def in self.config["roles"]["global_post_grants"]:
             privilege    = grant_def["privilege"]
             to_role      = grant_def["to_role"]
             admin_option = grant_def.get("admin_option", False)
             print(f"\n  Grant {privilege} a {to_role}...")
-            await self.execute(self._grant_sql(privilege, to_role, admin_option))
+            await self.execute(self._grant_sql(self._qi(privilege), to_role, admin_option))
 
         print("\n✓ Roles globales creados exitosamente")
 
@@ -177,7 +184,7 @@ class PostgreSQLRoleCreator:
 
             # Grant temporal del owner al usuario de conexión
             print(f"  Grant {owner} TO {self.user} (temporal)...")
-            await conn.execute(self._grant_sql(owner, self.user))
+            await conn.execute(self._grant_sql(self._qi(owner), self.user))
 
             schemas = await self._get_schemas(conn) or ["public"]
             print(f"\n  Base de datos: {db_name}")
@@ -194,19 +201,19 @@ class PostgreSQLRoleCreator:
 
                 # Herencia del owner original de la BD
                 if role_def.get("inherit_db_owner"):
-                    await conn.execute(self._grant_sql(owner, role_name))
+                    await conn.execute(self._grant_sql(self._qi(owner), role_name))
 
                 # CONNECT en la base de datos
                 if role_def.get("connect"):
                     await conn.execute(
-                        self._grant_sql(f"CONNECT ON DATABASE {db_name}", role_name)
+                        self._grant_sql(f'CONNECT ON DATABASE {self._qi(db_name)}', role_name)
                     )
 
                 # Privilegios por esquema y tipo de objeto
                 for schema in schemas:
                     if role_def.get("schema_usage"):
                         await conn.execute(
-                            self._grant_sql(f"USAGE ON SCHEMA {schema}", role_name)
+                            self._grant_sql(f'USAGE ON SCHEMA {self._qi(schema)}', role_name)
                         )
 
                     for obj_priv in role_def.get("object_privileges", []):
@@ -234,7 +241,7 @@ class PostgreSQLRoleCreator:
                 for membership in role_def.get("grants_to", []):
                     await conn.execute(
                         self._grant_sql(
-                            role_name,
+                            self._qi(role_name),
                             membership["role"],
                             admin_option=membership.get("admin_option", False),
                         )
@@ -249,7 +256,7 @@ class PostgreSQLRoleCreator:
             if conn:
                 try:
                     print(f"  Revoke {owner} FROM {self.user}...")
-                    await conn.execute(self._revoke_sql(owner, self.user))
+                    await conn.execute(self._revoke_sql(self._qi(owner), self.user))
                 except Exception as e:
                     print(f"  ⚠ Error al revocar permisos: {e}")
                 await conn.close()
