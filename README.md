@@ -82,7 +82,7 @@ create_role   = "CREATE ROLE {role_name} WITH INHERIT NOLOGIN CONNECTION LIMIT 0
 grant_role    = "GRANT {privilege} TO {to_role}{admin_clause};"
 revoke_role   = "REVOKE {privilege} FROM {from_role};"
 grant_on_all  = "GRANT {privileges} ON ALL {object_type} IN SCHEMA {schema} TO {role};"
-default_privs = "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT {privileges} ON {object_type} TO {role};"
+default_privs = "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} GRANT {privileges} ON {object_type} TO {role};"
 ```
 
 > - `CREATE ROLE` duplicado → Python captura `DuplicateObjectError` y muestra `⚠ El objeto ya existe`.
@@ -97,6 +97,7 @@ default_privs = "ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT {privileges} 
 | `{to_role}` | Rol que recibe el permiso | `grant_role` |
 | `{from_role}` | Rol al que se revoca el permiso | `revoke_role` |
 | `{admin_clause}` | ` WITH ADMIN OPTION` o vacío | `grant_role` |
+| `{owner}` | Owner de la base de datos (para default privileges) | `default_privs` |
 | `{privileges}` | Privilegios sobre objetos | `grant_on_all`, `default_privs` |
 | `{object_type}` | Tipo de objeto PostgreSQL | `grant_on_all`, `default_privs` |
 | `{schema}` | Nombre del esquema | `grant_on_all`, `default_privs` |
@@ -293,7 +294,93 @@ role_dba (gestiona todos los roles con ADMIN OPTION)
          - GRANT privilegios ON ALL {object_type}
          - ALTER DEFAULT PRIVILEGES (si `default_privileges = true`)
      - Para cada `[[db_roles.grants_to]]`: GRANT al rol global
-   - Revoke temporal del owner
+    - Revoke temporal del owner
+
+---
+## Eliminación de roles
+
+El script actual **no incluye funcionalidad automática para eliminar roles** por razones de seguridad. Eliminar un rol en PostgreSQL requiere verificar dependencias y seguir un proceso cuidadoso para evitar romper permisos o objetos dependientes.
+
+### Validación de dependencias
+
+Antes de intentar eliminar un rol, debe verificar si existen objetos que dependan de él utilizando la vista del sistema `pg_shdepend`:
+
+```sql
+SELECT 
+    d.classid::regclass,
+    pg_describe_object(d.classid, d.objid, d.objsubid) AS dependent_object
+FROM pg_shdepend d
+JOIN pg_roles r ON r.oid = d.refobjid
+WHERE r.rolname = '<role_name>';
+```
+
+Este query mostrará qué tipos de objetos (tablas, funciones, etc.) dependen del rol especificado.
+
+### Validación de privilegios por defecto
+
+Además de verificar dependencias directas, debe comprobar si existen privilegios por defecto (default ACLs) asignados al rol que se pretende eliminar. Estos privilegios se aplican automáticamente a los nuevos objetos creados en ciertos esquemas y deben ser eliminados antes de dropping el rol.
+
+```sql
+SELECT
+    defaclrole::regrole AS owner_role,
+    defaclnamespace::regnamespace AS schema_name,
+    defaclobjtype AS object_type,
+    defaclacl
+FROM pg_default_acl
+WHERE defaclacl::text LIKE '%<role_name>%';
+```
+
+Este query mostrará si el rol tiene privilegios por defecto configurados en algún esquema. Si se encuentran resultados, debe revocar esos privilegios por defecto antes de proceder con la eliminación del rol utilizando:
+```sql
+ALTER DEFAULT PRIVILEGES IN SCHEMA <schema_name> REVOKE <privileges> ON <object_type> FROM <role_name>;
+```
+
+### Proceso seguro de eliminación
+
+Para eliminar un rol creado por este script, siga estos pasos:
+
+1. **Verificar dependencias**: Ejecute el query anterior para identificar objetos dependientes
+2. **Revocar permisos explícitos**: Si el rol tiene permisos directos sobre objetos, revóquelos:
+   ```sql
+   REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM <role_name>;
+   REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM <role_name>;
+   -- Repetir para otros esquemas y tipos de objeto según sea necesario
+   ```
+3. **Eliminar membresías**: Revocar el rol de cualquier otro rol al que haya sido otorgado:
+   ```sql
+   REVOKE <role_name> FROM <grantee_role>;
+   ```
+4. **Eliminar el rol**: Finalmente, eliminar el rol:
+   ```sql
+   DROP ROLE <role_name>;
+   ```
+
+### Consideraciones importantes
+
+- **Roles con `WITH ADMIN OPTION`**: Roles creados con `admin_option = true` permiten a sus miembros otorgar el rol a otros. Antes de eliminar dicho rol, asegúrese de que no haya sido otorgado a otros roles.
+- **Jerarquía de roles**: En la configuración actual, `role_dba` hereda todos los demás roles con `ADMIN OPTION`. Eliminar un rol heredado por `role_dba` podría afectar sus permisos efectivos.
+- **Roles por base de datos**: Los roles siguen el patrón `role_*_{db}` (ej: `role_writer_mi_app`). Asegúrese de especificar el nombre exacto al verificar y eliminar.
+- **Transaccionalidad**: Si bien `DROP ROLE` es transaccional en PostgreSQL, los `REVOKE` previos lo son también, por lo que se recomienda ejecutar todo en una sola transacción si se automatiza el proceso.
+
+### Ejemplo práctico
+
+Para eliminar `role_writer_mi_app`:
+
+```sql
+-- 1. Verificar dependencias
+SELECT 
+    d.classid::regclass,
+    pg_describe_object(d.classid, d.objid, d.objsubid) AS dependent_object
+FROM pg_shdepend d
+JOIN pg_roles r ON r.oid = d.refobjid
+WHERE r.rolname = 'role_writer_mi_app';
+
+-- 2. Si no hay dependencias críticas o se han gestionado, proceder con:
+REVOKE role_writer_mi_app FROM role_dba;  -- Si fue otorgado con ADMIN OPTION
+REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM role_writer_mi_app;
+REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM role_writer_mi_app;
+DROP ROLE role_writer_mi_app;
+```
 
 ## Seguridad
 
@@ -387,9 +474,9 @@ CREATE ROLE role_writer_mi_app WITH INHERIT NOLOGIN CONNECTION LIMIT 0;
 GRANT CONNECT ON DATABASE mi_app TO role_writer_mi_app;
 GRANT USAGE ON SCHEMA public TO role_writer_mi_app;
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO role_writer_mi_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO role_writer_mi_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO role_writer_mi_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO role_writer_mi_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO role_writer_mi_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE ON SEQUENCES TO role_writer_mi_app;
 GRANT role_writer_mi_app TO role_dba WITH ADMIN OPTION;
 
 -- Reader role (object_privileges: TABLES + SEQUENCES)
@@ -397,9 +484,9 @@ CREATE ROLE role_reader_mi_app WITH INHERIT NOLOGIN CONNECTION LIMIT 0;
 GRANT CONNECT ON DATABASE mi_app TO role_reader_mi_app;
 GRANT USAGE ON SCHEMA public TO role_reader_mi_app;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO role_reader_mi_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO role_reader_mi_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT SELECT ON TABLES TO role_reader_mi_app;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO role_reader_mi_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO role_reader_mi_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE ON SEQUENCES TO role_reader_mi_app;
 GRANT role_reader_mi_app TO role_dba WITH ADMIN OPTION;
 ```
 
@@ -435,7 +522,7 @@ CREATE ROLE role_executor_mi_app WITH INHERIT NOLOGIN CONNECTION LIMIT 0;
 GRANT CONNECT ON DATABASE mi_app TO role_executor_mi_app;
 GRANT USAGE ON SCHEMA public TO role_executor_mi_app;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO role_executor_mi_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO role_executor_mi_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO role_executor_mi_app;
 GRANT role_executor_mi_app TO role_dba WITH ADMIN OPTION;
 ```
 
