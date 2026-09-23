@@ -15,7 +15,7 @@ Script en Python para la creación automatizada de roles y permisos en PostgreSQ
 ## Estructura del Proyecto
 
 ```
-crear-roles-postgres/
+creación de roles/
 ├── role_creator.py       ← Motor genérico (no necesita modificarse)
 ├── roles_config.toml     ← Definición de roles, privilegios y plantillas SQL
 ├── .env                  ← Credenciales de conexión (no versionado)
@@ -54,9 +54,22 @@ PGDATABASE=postgres
 # Si no se especifica, procesa todas las DBs
 PG_TARGET_DATABASES=db_contabilidad,db_marketing,dblog
 
+# Opcional: Roles EXTRA (además del owner de cada BD) sobre los que se
+# ejecutará ALTER DEFAULT PRIVILEGES para cubrir objetos futuros.
+# Roles separados por coma. Deben existir previamente en el servidor:
+# si alguno NO existe, el script ABORTA antes de crear cualquier rol.
+# Si no se define, solo se usa el owner de cada BD.
+PG_DEFAULT_PRIV_ROLES=usr_conta,usr_mkt
+
 # Opcional: Ruta al archivo de configuración TOML (por defecto: roles_config.toml)
 ROLES_CONFIG=roles_config.toml
 ```
+
+> **Validación temprana de `PG_DEFAULT_PRIV_ROLES`:** al iniciar, el script
+> consulta `pg_roles` para confirmar que cada rol declarado exista. Si falta
+> alguno, imprime la lista de roles inexistentes y aborta con `RuntimeError`
+> **sin haber creado todavía ningún rol ni ejecutado ningún GRANT**. Esto
+> evita aplicar cambios parciales cuando la variable está mal escrita.
 
 ### Paso 2 — Archivo de configuración TOML
 
@@ -83,10 +96,29 @@ grant_role    = "GRANT {privilege} TO {to_role}{admin_clause};"
 revoke_role   = "REVOKE {privilege} FROM {from_role};"
 grant_on_all  = "GRANT {privileges} ON ALL {object_type} IN SCHEMA {schema} TO {role};"
 default_privs = "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {schema} GRANT {privileges} ON {object_type} TO {role};"
+list_databases = '''SELECT d.datname AS nombre_base_datos, r.rolname AS owner
+                   FROM pg_database d JOIN pg_roles r ON d.datdba = r.oid
+                   WHERE d.datname NOT IN ('postgres','template0','template1','cloudsqladmin')
+                     AND d.datistemplate = false
+                   ORDER BY d.datname;'''
+list_schemas  = '''SELECT schema_name FROM information_schema.schemata
+                   WHERE schema_name NOT IN ('pg_catalog','information_schema')
+                     AND schema_name NOT LIKE 'pg_%'
+                   ORDER BY schema_name;'''
 ```
 
 > - `CREATE ROLE` duplicado → Python captura `DuplicateObjectError` y muestra `⚠ El objeto ya existe`.
 > - `GRANT` duplicado → PostgreSQL lo ignora silenciosamente (idempotente nativo).
+> - `list_databases` se ejecuta en la BD de conexión (`PGDATABASE`) y devuelve `nombre_base_datos` + `owner`.
+> - `list_schemas` se ejecuta **dentro de cada BD procesada** y devuelve los esquemas de usuario (excluye `pg_*`, `information_schema`).
+
+**Columnas devueltas por las plantillas de descubrimiento:**
+
+| Plantilla | Columna | Tipo | Descripción |
+|-----------|---------|------|-------------|
+| `list_databases` | `nombre_base_datos` | string | Nombre de la BD de usuario |
+| `list_databases` | `owner` | string | Rol propietario (`pg_database.datdba`) |
+| `list_schemas`  | `schema_name` | string | Nombre del esquema en la BD actual |
 
 **Placeholders disponibles:**
 
@@ -278,23 +310,26 @@ role_dba (gestiona todos los roles con ADMIN OPTION)
 
 1. **Carga del TOML**: Lee `roles_config.toml`
 2. **Conexión**: Se conecta al servidor PostgreSQL
-3. **Roles Globales**: Crea los roles de `[roles.global]`
-4. **Post-Grants**: Ejecuta los grants de `[roles.global_post_grants]`
-5. **Descubrimiento**: Obtiene lista de bases de datos
-6. **Filtrado**: Aplica filtro `PG_TARGET_DATABASES` si está definido
-7. **Por cada base de datos:**
+3. **Validación de `PG_DEFAULT_PRIV_ROLES`**: Si está definida, comprueba que todos los roles existan en el servidor. Si falta alguno → **aborta con `RuntimeError` antes de crear nada**
+4. **Roles Globales**: Crea los roles de `[roles.global]`
+5. **Post-Grants**: Ejecuta los grants de `[roles.global_post_grants]`
+6. **Descubrimiento**: Obtiene lista de bases de datos (`list_databases`)
+7. **Filtrado**: Aplica filtro `PG_TARGET_DATABASES` si está definido
+8. **Por cada base de datos:**
    - Grant temporal del owner al usuario de conexión
+   - Grant temporal adicional de cada rol en `PG_DEFAULT_PRIV_ROLES` (para poder emitir `ALTER DEFAULT PRIVILEGES FOR ROLE <rol>`)
    - **Para cada `[[db_roles]]` del TOML:**
-     - Crea el rol (si ya existe, lo omite)
+     - Crea el rol (si ya existe, lo omite con `⚠`)
      - Si `inherit_db_owner`: GRANT del owner
      - Si `connect`: GRANT CONNECT ON DATABASE
      - Para cada esquema:
        - Si `schema_usage`: GRANT USAGE ON SCHEMA
        - Para cada `[[db_roles.object_privileges]]`:
          - GRANT privilegios ON ALL {object_type}
-         - ALTER DEFAULT PRIVILEGES (si `default_privileges = true`)
+         - `ALTER DEFAULT PRIVILEGES` por cada rol efectivo (owner + `PG_DEFAULT_PRIV_ROLES`), si `default_privileges = true`
      - Para cada `[[db_roles.grants_to]]`: GRANT al rol global
-    - Revoke temporal del owner
+   - Revoke temporal del owner y de los roles extra (en bloque `finally`, se ejecuta incluso ante errores)
+9. **Generación del log**: Al finalizar, crea `scripts_{dbs}_{timestamp}.txt` con todas las sentencias ejecutadas (ver [Archivo de salida de scripts](#archivo-de-salida-de-scripts))
 
 ---
 ## Eliminación de roles
@@ -382,6 +417,46 @@ REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public FROM role_writer_mi_app;
 DROP ROLE role_writer_mi_app;
 ```
 
+## Archivo de salida de scripts
+
+Tras una ejecución exitosa (o con errores parciales) el script genera automáticamente un archivo `.txt` en el directorio de trabajo con todas las sentencias SQL ejecutadas, útil para auditoría, versionado o reproducción manual.
+
+**Nombre del archivo:**
+
+```
+scripts_{dbs}_{YYYYMMDD_HHMMSS}.txt
+```
+
+Donde `{dbs}` se forma así:
+- Si se procesaron **más de 3 bases de datos** → `Ndbs` (ej: `7dbs`).
+- Si se procesaron **3 o menos** → concatenación de los nombres normalizados con `_` (ej: `db_contabilidad_db_marketing`).
+
+**Contenido (estructura por secciones):**
+
+```text
+-- =============================================================================
+-- ROLES GLOBALES
+-- =============================================================================
+CREATE ROLE "role_dba" ...
+GRANT "role_monitoring" TO "role_dba" WITH ADMIN OPTION;
+
+-- =============================================================================
+-- BASE DE DATOS: db_contabilidad
+-- =============================================================================
+CREATE ROLE "role_owner_db_contabilidad" ...;
+GRANT "usr_conta" TO "role_owner_db_contabilidad";
+...
+```
+
+Las sentencias que fallaron se incluyen igual, seguidas de un comentario:
+
+```sql
+CREATE ROLE "role_dba" ...;
+-- ERROR: DuplicateObjectError: El objeto ya existe
+```
+
+Las sentencias que no se ejecutaron (por ejemplo, las de una BD que falló en mitad del proceso) **no aparecen** en el archivo.
+
 ## Seguridad
 
 - Los grants al usuario de conexión son **temporales**
@@ -401,6 +476,7 @@ Usuario:               postgres
 Base de datos inicial: postgres
 Configuración:         roles_config.toml
 Bases de datos objetivo: db_contabilidad, db_marketing
+Roles default privileges extra: usr_conta, usr_mkt
 
 ============================================================
 CREANDO ROLES GLOBALES

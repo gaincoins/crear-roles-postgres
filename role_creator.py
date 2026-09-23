@@ -26,6 +26,7 @@ class PostgreSQLRoleCreator:
         password: str,
         database: str = "postgres",
         target_databases: Optional[List[str]] = None,
+        default_priv_roles: Optional[List[str]] = None,
         config_path: str = "roles_config.toml",
     ):
         self.host = host
@@ -34,6 +35,7 @@ class PostgreSQLRoleCreator:
         self.password = password
         self.database = database
         self.target_databases = target_databases or []
+        self.default_priv_roles = default_priv_roles or []
         self.connection = None
         self.executed_scripts: List[Dict[str, Any]] = []
 
@@ -207,6 +209,40 @@ class PostgreSQLRoleCreator:
         return [row["schema_name"] for row in records]
 
     # -------------------------------------------------------------------------
+    # Validación de roles adicionales para default privileges
+    # -------------------------------------------------------------------------
+
+    async def _validate_default_priv_roles(self):
+        """Verifica que todos los roles indicados en PG_DEFAULT_PRIV_ROLES existan
+        en el servidor antes de crear cualquier rol. Aborta con RuntimeError si falta alguno."""
+        if not self.default_priv_roles:
+            return
+
+        print("\n" + "=" * 60)
+        print("VALIDANDO ROLES DE PG_DEFAULT_PRIV_ROLES")
+        print("=" * 60)
+        print(f"Roles declarados: {', '.join(self.default_priv_roles)}")
+
+        rows = await self.connection.fetch(
+            "SELECT rolname FROM pg_roles WHERE rolname = ANY($1::text[])",
+            self.default_priv_roles,
+        )
+        existentes = {r["rolname"] for r in rows}
+        faltantes = [r for r in self.default_priv_roles if r not in existentes]
+
+        if faltantes:
+            print("\n✗ Los siguientes roles NO existen en el servidor PostgreSQL:")
+            for f in faltantes:
+                print(f"  - {f}")
+            print("\nDeteniendo el proceso antes de crear cualquier rol.")
+            print("Corrige la variable de entorno PG_DEFAULT_PRIV_ROLES o crea los roles faltantes.")
+            raise RuntimeError(
+                f"PG_DEFAULT_PRIV_ROLES contiene roles inexistentes: {', '.join(faltantes)}"
+            )
+
+        print("✓ Todos los roles existen en el servidor")
+
+    # -------------------------------------------------------------------------
     # Procesamiento por base de datos (genérico — lee [[db_roles]] del TOML)
     # -------------------------------------------------------------------------
 
@@ -226,12 +262,31 @@ class PostgreSQLRoleCreator:
             print(f"  Grant {owner} TO {self.user} (temporal)...")
             await conn.execute(self._grant_sql(self._qi(owner), self.user))
 
+            # Otorgar temporalmente los roles extra del env para poder ejecutar
+            # ALTER DEFAULT PRIVILEGES FOR ROLE <rol> (requiere ser miembro del rol).
+            temp_granted: List[str] = [owner]
+            for r in self.default_priv_roles:
+                if r and r.lower() != owner.lower() and r.lower() not in {x.lower() for x in temp_granted}:
+                    print(f"  Grant {r} TO {self.user} (temporal, para default privileges)...")
+                    try:
+                        await conn.execute(self._grant_sql(self._qi(r), self.user))
+                        temp_granted.append(r)
+                    except Exception as e:
+                        print(f"  ⚠ No se pudo otorgar {r} a {self.user}: {e}")
+
             schemas = await self._get_schemas(conn) or ["public"]
             print(f"\n  Base de datos: {db_name}")
             print(f"  Owner:         {owner}")
             print(f"  Esquemas:      {', '.join(schemas)}")
 
             normalized = db_name.replace("-", "_").lower()
+
+            effective_dp_owners: List[str] = [owner]
+            _seen = {owner.lower()}
+            for _r in self.default_priv_roles:
+                if _r and _r.lower() not in _seen:
+                    effective_dp_owners.append(_r)
+                    _seen.add(_r.lower())
 
             # Iterar sobre cada plantilla de rol definida en el TOML
             for role_def in self.config["db_roles"]:
@@ -274,16 +329,18 @@ class PostgreSQLRoleCreator:
                             db_name,
                         )
 
-                        # ALTER DEFAULT PRIVILEGES (si aplica)
+                        # ALTER DEFAULT PRIVILEGES (si aplica) — una sentencia por cada rol efectivo
                         if obj_priv.get("default_privileges"):
-                            await self._exec_and_log(
-                                conn,
-                                self.config["sql"]["default_privs"].format(
-                                    owner=owner, privileges=privileges, object_type=obj_type,
-                                    schema=schema, role=role_name
-                                ),
-                                db_name,
-                            )
+                            for dp_owner in effective_dp_owners:
+                                print(f"    ALTER DEFAULT PRIVILEGES FOR ROLE {dp_owner} ...")
+                                await self._exec_and_log(
+                                    conn,
+                                    self.config["sql"]["default_privs"].format(
+                                        owner=dp_owner, privileges=privileges, object_type=obj_type,
+                                        schema=schema, role=role_name
+                                    ),
+                                    db_name,
+                                )
 
                 # Membresías (grants_to)
                 for membership in role_def.get("grants_to", []):
@@ -304,11 +361,12 @@ class PostgreSQLRoleCreator:
 
         finally:
             if conn:
-                try:
-                    print(f"  Revoke {owner} FROM {self.user}...")
-                    await conn.execute(self._revoke_sql(self._qi(owner), self.user))
-                except Exception as e:
-                    print(f"  ⚠ Error al revocar permisos: {e}")
+                for r in temp_granted:
+                    try:
+                        print(f"  Revoke {r} FROM {self.user}...")
+                        await conn.execute(self._revoke_sql(self._qi(r), self.user))
+                    except Exception as e:
+                        print(f"  ⚠ Error al revocar {r}: {e}")
                 await conn.close()
 
     # -------------------------------------------------------------------------
@@ -369,6 +427,7 @@ class PostgreSQLRoleCreator:
     async def run(self):
         try:
             await self.connect()
+            await self._validate_default_priv_roles()
             await self.create_global_roles()
 
             databases = await self.get_databases()
@@ -406,6 +465,12 @@ async def main():
         if target_databases_env else None
     )
 
+    default_priv_roles_env = os.getenv("PG_DEFAULT_PRIV_ROLES", "")
+    default_priv_roles = (
+        [r.strip() for r in default_priv_roles_env.split(",") if r.strip()]
+        if default_priv_roles_env else []
+    )
+
     print("=" * 60)
     print("CREACIÓN DE ROLES POSTGRESQL")
     print("=" * 60)
@@ -417,6 +482,10 @@ async def main():
         print(f"Bases de datos objetivo: {', '.join(target_databases)}")
     else:
         print("Bases de datos objetivo: TODAS (no se especificó PG_TARGET_DATABASES)")
+    if default_priv_roles:
+        print(f"Roles default privileges extra: {', '.join(default_priv_roles)}")
+    else:
+        print("Roles default privileges extra: (ninguno — solo owner de cada BD)")
 
     creator = PostgreSQLRoleCreator(
         host=host,
@@ -425,6 +494,7 @@ async def main():
         password=password,
         database=database,
         target_databases=target_databases,
+        default_priv_roles=default_priv_roles,
         config_path=config_path,
     )
     await creator.run()
